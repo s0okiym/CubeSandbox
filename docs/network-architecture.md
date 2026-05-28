@@ -30,52 +30,51 @@
 
 CubeSandbox 的网络方案**不使用**传统容器网络模型（veth pair + network namespace + iptables/CNI）。取而代之的是一套完全基于 **TAP 设备 + eBPF TC filter** 的自研方案，由以下组件协作完成：
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          用户请求                                    │
-│  E2B SDK ──> CubeAPI (Rust, :3000) ──> CubeMaster (Go, :8089)      │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │ gRPC
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Cubelet (Go, 每节点)                              │
-│  network plugin ──> network-agent client                            │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │ gRPC / Unix socket / SCM_RIGHTS
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                 Network Agent (Go, 每节点)                           │
-│  TAP 创建/池化 ──> CubeVS eBPF 注册 ──> 端口映射 ──> 状态持久化     │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │ cubevs Go 库调用
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│               CubeVS eBPF 虚拟交换机 (内核态)                        │
-│  from_cube (TAP ingress) ──> SNAT/DNAT ──> from_world (NIC ingress)│
-│  from_envoy (cubegw0 egress) ──> DNAT ──> TAP redirect             │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │ TAP fd
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│              Hypervisor (Rust, Cloud Hypervisor fork)                │
-│  virtio-net ──> TAP fd ──> guest 内核 virtio-net 驱动               │
-└─────────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Sandbox Guest OS                                  │
-│  cube-agent (PID 1) 配置 IP/路由/ARP ──> 应用监听端口                │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["用户请求"] --> B["E2B SDK"]
+    B --> C["CubeAPI (Rust, :3000)"]
+    C -->|"HTTP"| D["CubeMaster (Go, :8089)"]
+    D -->|"gRPC"| E["Cubelet (Go, 每节点)"]
+    E -->|"network plugin"| F["Network Agent (Go, 每节点)"]
+    F -->|"TAP 创建/池化"| G["CubeVS eBPF 虚拟交换机 (内核态)"]
+    F -->|"cubevs Go 库调用"| G
+    F -->|"端口映射 + 状态持久化"| G
+
+    G -->|"from_cube: TAP ingress → SNAT/DNAT"| H["宿主机 NIC (eth0)"]
+    G -->|"from_world: NIC ingress → DNAT"| I["TAP 设备"]
+    G -->|"from_envoy: cubegw0 egress → DNAT"| I
+
+    I -->|"TAP fd"| J["Hypervisor (Rust, Cloud Hypervisor fork)"]
+    J -->|"virtio-net 数据路径"| K["Sandbox Guest OS"]
+    K --> L["cube-agent (PID 1) 配置 IP/路由/ARP"]
+    L --> M["应用监听端口"]
+
+    E -->|"gRPC / Unix socket"| F
+    F -->|"SCM_RIGHTS 传递 TAP fd"| J
+
+    style A fill:#4CAF50,color:#fff
+    style G fill:#FF9800,color:#fff
+    style J fill:#2196F3,color:#fff
+    style K fill:#9C27B0,color:#fff
 ```
 
 外部访问路径：
 
-```
-用户浏览器 ──> CoreDNS (*.cube.app → 节点IP)
-           ──> CubeProxy (OpenResty, TLS终止, :443/:80)
-           ──> Redis 查询 sandbox 路由元数据
-           ──> 同节点: 直连 TAP IP:容器端口
-              跨节点: 通过 host port 代理
+```mermaid
+flowchart LR
+    A["用户浏览器"] -->|"*.cube.app 域名解析"| B["CoreDNS"]
+    B -->|"返回节点 IP"| C["CubeProxy (OpenResty, TLS终止, :443/:80)"]
+    C -->|"查询路由元数据"| D["Redis"]
+    D -->|"返回 HostIP + SandboxIP + 端口映射"| C
+
+    C -->|"同节点优化: 直连 TAP IP:容器端口"| E["Sandbox TAP 设备"]
+    C -->|"跨节点: 通过 host port 代理"| F["目标节点 Network Agent Host Proxy"]
+    F -->|"SO_BINDTODEVICE 绑定 TAP"| E
+
+    style A fill:#4CAF50,color:#fff
+    style C fill:#FF9800,color:#fff
+    style E fill:#9C27B0,color:#fff
 ```
 
 ---
